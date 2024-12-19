@@ -1,0 +1,114 @@
+## SVM classifier (PART VS. AD) 
+
+```{r}
+library(tidyverse)
+library(sesame)
+library(SummarizedExperiment)
+library(e1071)
+library(caret)
+library(GEOquery)
+```
+
+### Split training and testing -- 80% of PART and %80 AD cases
+```{r}
+se <- readRDS("~/PART_AD/ROSMAP/ROSMAP_SE.rds")
+df <- colData(se) %>% as.data.frame()
+path_cnts <- df %>% filter(pathology %in% c("AD","PART")) %>% 
+  pull(pathology) %>% table()
+n_train_part <- ceiling(path_cnts["PART"] * .8)
+n_train_ad <- ceiling(path_cnts["AD"] * .8)
+set.seed(123)
+part_training <- sample(df$meth_id[df$pathology == "PART"],n_train_part)
+part_testing <- df$meth_id[(df$pathology == "PART") & (!df$meth_id %in% part_training)]
+set.seed(123)
+ad_training <- sample(df$meth_id[df$pathology == "AD"],n_train_ad)
+ad_testing <- df$meth_id[(df$pathology == "AD") & (!df$meth_id %in% ad_training)]
+
+training_samples <- c(part_training,ad_training)
+training_labels <- factor(df[training_samples,"pathology"])
+testing_samples <- c(part_testing,ad_testing)
+testing_labels <- factor(df[testing_samples,"pathology"])
+```
+
+
+### Model 1 (S4B,C)
+```{r}
+se_training <- se[,training_samples]
+se_ok = checkLevels(assay(se_training), colData(se_training)$pathology)
+fml <- "~age + sex + sample_plate + pathology"
+res <- DML(se_training[se_ok,], as.formula(fml),
+           BPPARAM=BiocParallel::MulticoreParam(40))
+smry <- summaryExtractTest(res) #saveRDS(smry,file="~/PART_AD/ROSMAP/ROSMAP_SVM_pretrain_features.rds")
+n_feat <- 1000
+features <- smry %>% arrange(Pval_pathologyPART) %>% 
+  dplyr::slice(1:n_feat) %>% pull(Probe_ID)
+
+train_betas <- assay(se_training)[features,] %>% 
+  imputeRowMean(.) %>% t()
+
+part_ad_classifier <- svm(x=train_betas,y=training_labels,kernel="linear")
+
+testModel <- function(model,betas) {
+  cgs <- colnames(model$SV)
+  if(any(!cgs %in% colnames(test_betas))) return(NA)
+  test_betas <- test_betas[,cgs]
+  predict(model, test_betas)
+}
+
+se_testing <- se[,testing_samples]
+test_betas <- assay(se_testing) %>% imputeRowMean(.) %>% t()
+test_predictions <- testModel(part_ad_classifier,test_betas)
+confusionMatrix(test_predictions,reference=testing_labels) 
+```
+
+### Now train on all data
+```{r}
+se <- readRDS("~/PART_AD/ROSMAP/ROSMAP_SE.rds")
+df <- colData(se) %>% as.data.frame()
+ad_training <- df$meth_id[df$pathology == "AD"] 
+part_training <- df$meth_id[df$pathology == "PART"]
+training_samples <- c(part_training,ad_training)
+training_labels <- factor(df[training_samples,"pathology"])
+se_training <- se[,training_samples]
+se_ok = checkLevels(assay(se_training), colData(se_training)$pathology)
+fml <- "~age + sex + sample_plate + pathology"
+res <- DML(se_training[se_ok,], as.formula(fml),
+           BPPARAM=BiocParallel::MulticoreParam(40))
+smry <- summaryExtractTest(res)
+n_feat <- 1000
+features <- smry %>% arrange(Pval_pathologyPART) %>% pull(Probe_ID)
+features <- features[1:n_feat]
+train_betas <- assay(se_training)[features,] %>% 
+  imputeRowMean(.) %>% t()
+part_ad_classifier_final <- svm(x=train_betas,y=training_labels,kernel="linear")
+saveRDS(part_ad_classifier_final,"~/PART_AD/ROSMAP/PART_AD_Classifier_WC.rds")
+```
+
+#Test classifier on external cohort (Smith et al 2018)
+```{r}
+se_msbb <- readRDS("~/PART_AD/GSE80970_SE.rds")
+df_msbb <- colData(se_msbb) %>% as.data.frame()
+filt <- colData(se_msbb)$region == "prefrontal cortex"
+se_msbb <- se_msbb[,filt]
+msbb_test_mtx <- assay(se_msbb) %>% imputeRowMean(.) 
+msbb_test_mtx <- t(msbb_test_mtx)
+df_msbb$prediction <- predict(part_ad_classifier_final, msbb_test_mtx[,features])
+
+df_msbb$braak <- df_msbb$`braak.stage.ch1`
+df_msbb <- df_msbb %>%
+  mutate(braak_grp=
+           case_when(
+             braak == "0" ~ "0",
+             braak %in% c("1","2") ~ "I/II",
+             braak %in% c("3","4") ~ "III/IV",
+             braak %in% c("5","6") ~ "V/VI"
+           )) 
+
+df_msbb %>% 
+  group_by(braak_grp) %>% 
+  summarise(PART=sum(prediction == "PART"),
+            PART_percent=sum(prediction == "PART")/n(),
+            AD=sum(prediction == "AD"),
+            AD_percent=sum(prediction == "AD")/n(),
+            Total=n())
+```
