@@ -1,0 +1,23 @@
+#Create summarized experiment 
+```{r}
+library(tidyverse)
+library(sesame)
+library(SummarizedExperiment)
+
+#Prepare PWG data
+idat_dir <- "~/PART_AD/PWG/idats/"
+betas = openSesame(idat_dir, BPPARAM=BiocParallel::MulticoreParam(40))
+meta <- read_tsv("~/PART_AD/PWG/PWG_Meta_Master.tsv")
+betas <- betas[,meta$meth_id]
+se <- SummarizedExperiment(assays = betas,colData = meta)
+saveRDS(se,file="~/PART_AD/PWG/PWG_SE.rds")
+
+
+#Prepare ROSMAP data
+idat_dir <- "~/PART_AD/ROSMAP/idats/"
+betas = openSesame(idat_dir, BPPARAM=BiocParallel::MulticoreParam(40))
+meta <- read_tsv("~/PART_AD/ROSMAP/ROSMAP_Meta_Master.tsv")
+betas <- betas[,meta$meth_id]
+se <- SummarizedExperiment(assays = betas,colData = meta)
+saveRDS(se,file="~/PART_AD/ROSMAP/ROSMAP_SE.rds")
+```
