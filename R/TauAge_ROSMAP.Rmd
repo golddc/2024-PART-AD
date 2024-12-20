@@ -1,0 +1,146 @@
+## Tau Age hipp model (ROSMAP)
+
+```{r}
+library(tidyverse)
+library(SummarizedExperiment)
+library(glmnet)
+source("~/hepler_functions.R")
+
+#Compute age adjusted pTau residual
+se <- readRDS("~/PART_AD/ROSMAP/ROSMAP_SE_New.rds")
+colData(se)$log_pTau_hip <- log(colData(se)$nft_hip + 1)
+meta <- colData(se) %>% as.data.frame()
+pTau_hip_age_model <- lm(log_pTau_hip ~ age, data=meta)
+meta$log_pTau_hip_age_adjusted <- meta$log_pTau_hip - predict(pTau_hip_age_model,meta) #actual - predicted pTau based on age
+colData(se)$log_pTau_hip_age_adjusted <- meta$log_pTau_hip_age_adjusted
+
+mtx <- cleanMatrixForClusterW(assay(se)) %>% imputeRowMean(.) 
+m <- meta %>% filter(sex == "M") %>% pull(meth_id)
+set.seed(123)
+f <- meta %>% filter(sex == "F") %>% pull(meth_id) %>% sample(.,length(m))
+set.seed(123)
+train_m <- sample(m,ceiling(length(m) * .8))
+train_f <- sample(f,ceiling(length(f) * .8))
+test_m <- m[!m %in% train_m]
+test_f <- c(f[!f %in% train_f],meta$meth_id[!meta$meth_id %in% c(m,f)]) #get remaining female testing samples 
+
+cgs <- rownames(mtx)
+fml <- "~age + sex + sample_plate + log_pTau_hip"
+res <- DML(se[cgs,], as.formula(fml),BPPARAM=BiocParallel::MulticoreParam(40))
+smry <- summaryExtractTest(res) %>%
+  arrange(Pval_log_pTau_hip)
+
+#Train models
+trainEN <- function(betas,pTau,...) {
+  fit <- cv.glmnet(
+    betas,
+    pTau,
+    nfolds=10,
+    alpha=0.5,
+    type.measure="mse",
+    family="gaussian",
+    ...
+  )
+  fit
+}
+
+feat <- smry$Probe_ID
+feat <- feat[!grepl("rs|ctl",feat)]
+n_feat <- seq(2000,30000,2000)
+
+train_mtx <- mtx[,c(train_m,train_f)]
+train_pTau_hip_age_adjusted <- meta[c(train_m,train_f),"log_pTau_hip_age_adjusted"]
+
+tau_age_hip_models <- mclapply(n_feat,function(x) {
+  cgs <- feat[1:x]
+  mtx2 <- t(train_mtx[cgs,])
+  model <- trainEN(betas=mtx2,pTau = train_pTau_hip_age_adjusted)
+},mc.cores=40) 
+names(tau_age_hip_models) <- paste0("Model_",as.character(n_feat))
+
+#predict on testing data
+test_mtx <-  t(mtx[,c(test_m,test_f)])
+test_pTau_hip_age_adjusted <- meta[rownames(test_mtx),"log_pTau_hip_age_adjusted"]
+
+testEN <- function(model,betas) {
+  cgs <- rownames(coef(model))[-1]
+  betas <- betas[,cgs]
+  predict(model,se=model[["lambda.min"]],newx=betas,type="response")
+}
+
+tau_age_hip_models_stat <- do.call(rbind,lapply(seq(tau_age_hip_models),function(x) {
+  model <- tau_age_hip_models[[x]]
+  predicted <- testEN(model=model,betas=test_mtx)
+  res <- cor.test(test_pTau_hip_age_adjusted,predicted)
+  data.frame(
+    Model=as.character(x),
+    Cor=res$estimate,
+    P=res$p.value
+  )
+}))
+  
+max_cor <- max(tau_age_hip_models_stat$Cor,na.rm=TRUE)
+tau_age_hipp <- tau_age_hip_models[[which(tau_age_hip_models_stat$Cor == max_cor)]]
+
+#predict again on all samples for summary stats
+pred <- testEN(model=tau_age_hipp,betas=t(mtx))
+
+tau_age_hipp_smry <- data.frame(
+  Sample=meta$meth_id,
+  Sex=meta$sex,
+  Predicted=pred[,1],
+  Actual=meta$log_pTau_hip_age_adjusted
+)
+```
+
+
+## Tau Age Midfrontal
+```{r}
+colData(se)$log_pTau_mf <- log(colData(se)$nft_mf + 1)
+pTau_mf_age_model <- lm(log_pTau_mf ~ age, data=colData(se) %>% as.data.frame())
+meta$log_pTau_mf_age_adjusted <- colData(se)$log_pTau_mf - predict(pTau_mf_age_model,meta) #actual - predicted pTau based on age
+colData(se)$log_pTau_mf_age_adjusted <- meta$log_pTau_mf_age_adjusted
+
+fml <- "~age + sex + sample_plate + log_pTau_mf"
+res <- DML(se[cgs,], as.formula(fml),BPPARAM=BiocParallel::MulticoreParam(40))
+smry <- summaryExtractTest(res) %>%
+  arrange(Pval_log_pTau_mf)
+feat <- smry$Probe_ID
+feat <- feat[!grepl("rs|ctl",feat)]
+n_feat <- seq(2000,30000,2000)
+
+train_pTau_mf_age_adjusted <- meta[c(train_m,train_f),"log_pTau_mf_age_adjusted"]
+
+tau_age_mf_models <- mclapply(n_feat,function(x) {
+  cgs <- feat[1:x]
+  mtx2 <- t(train_mtx[cgs,])
+  model <- trainEN(betas=mtx2,pTau = train_pTau_mf_age_adjusted)
+},mc.cores=40) 
+names(tau_age_mf_models) <- paste0("Model_",as.character(n_feat))
+
+test_pTau_mf_age_adjusted <- meta[rownames(test_mtx),"log_pTau_mf_age_adjusted"]
+
+tau_age_mf_models_stat <- do.call(rbind,lapply(seq(tau_age_mf_models),function(x) {
+  model <- tau_age_mf_models[[x]]
+  predicted <- testEN(model=model,betas=test_mtx)
+  res <- cor.test(test_pTau_mf_age_adjusted,predicted)
+  data.frame(
+    Model=as.character(x),
+    Cor=res$estimate,
+    P=res$p.value
+  )
+}))
+  
+max_cor <- max(tau_age_mf_models_stat$Cor,na.rm=TRUE)
+tau_age_mf <- tau_age_mf_models[[which(tau_age_mf_models_stat$Cor == max_cor)]]
+
+#predict again on all samples for summary stats
+pred <- testEN(model=tau_age_mf,betas=t(mtx))
+
+tau_age_mf_smry <- data.frame(
+  Sample=meta$meth_id,
+  Sex=meta$sex,
+  Predicted=pred[,1],
+  Actual=meta$log_pTau_mf_age_adjusted
+)
+```
