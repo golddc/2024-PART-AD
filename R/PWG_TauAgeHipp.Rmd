@@ -1,9 +1,10 @@
-### TauAge (Hipp) model to predict age adjusted hippocampal pTau in PWG (1D)
+### TauAge (Hipp) model to predict age adjusted hippocampal pTau in PWG (1D,S2C)
 
 ```{r}
 library(tidyverse)
 library(SummarizedExperiment)
 library(glmnet)
+library(dnaMethyAge)
 source("~/hepler_functions.R")
 
 #Compute age adjusted pTau residual
@@ -89,4 +90,75 @@ tau_age_hipp_smry <- data.frame(
   Predicted=pred[,1],
   Actual=meta$log_pTau_age_adjusted
 )
+```
+
+### Test whether model cgs associate with regular and epigenetic aging (S2C,D)
+```{r}
+se <- readRDS("~/PART_AD/PWG/PWG_SE.rds")
+se2 <- cleanMatrixForClusterSE(se,f_row = .75) #75% coverage across samples
+
+getModelCGs <- function(model) {
+  tmp_coeffs <- coef(model, s = "lambda.min")
+  cgs <- tmp_coeffs@Dimnames[[1]][tmp_coeffs@i + 1][-1]
+  return(cgs)
+}
+
+tau_age_hipp_cgs <- getModelCGs(tau_age_hipp)
+
+res <- DML(se2,~age + sex + sample_plate,BPPARAM=BiocParallel::MulticoreParam(40))
+smry <- summaryExtractTest(res)
+smry <- smry %>%
+  mutate(FDR_age=p.adjust(Pval_age,method="fdr")) %>%
+  mutate(TauAge_CpG=
+           case_when(
+             Probe_ID %in% tau_age_hipp_cgs ~ "Y",
+             TRUE ~ "N"
+             ))
+
+#Compute epigenetic age prediction and compare with tau age
+library(dnaMethyAge)
+betas <- assay(se) %>% imputeRowMean(.)
+
+age_info <- data.frame(
+  Sample=colnames(betas),
+  Age=colData(se)$age
+)
+
+epi_age_Horvath <- methyAge(
+  betas, 
+  clock="HorvathS2013",
+  simple_mode=FALSE,
+  age_info=age_info,
+  fit_method='Linear',
+  do_plot=FALSE
+) 
+
+epi_age_Horvath$log_pTau <- meta[epi_age_Horvath$Sample,"log_pTau"]
+epi_age_Horvath$log_pTau_age_adjusted <- meta[epi_age_Horvath$Sample,"log_pTau_age_adjusted"]
+cor.test(epi_age_Horvath$Age_Acceleration,epi_age_Horvath$log_pTau) 
+cor.test(epi_age_Horvath$Age_Acceleration,epi_age_Horvath$log_pTau_age_adjusted) 
+
+cortical_coef <- read_delim("~/CorticalClock/CorticalClock/PredCorticalAge/CorticalClockCoefs.txt",delim=" ")
+load("~/CorticalClock/CorticalClock/PredCorticalAge/Ref_DNAm_brain_values.rdat") #Download from Shireby 2020 PMID:33300551
+
+missing <- apply(betas[cortical_coef$probe,],1,function(x) sum(is.na(x)) == ncol(betas))
+missing <- names(which(missing))
+for (cg in missing) {
+  beta <- unname(ref[cg])
+  betas[cg,] <- beta
+}
+
+epi_age_Cortical <- methyAge(
+  betas, 
+  clock="ShirebyG2020",
+  simple_mode=FALSE,
+  age_info=age_info,
+  fit_method='Linear',
+  do_plot=FALSE
+) 
+
+epi_age_Cortical$log_pTau <- meta[epi_age_Cortical$Sample,"log_pTau"]
+epi_age_Cortical$log_pTau_age_adjusted <- meta[epi_age_Cortical$Sample,"log_pTau_age_adjusted"]
+cor.test(epi_age_Cortical$Age_Acceleration,epi_age_Cortical$log_pTau) 
+cor.test(epi_age_Cortical$Age_Acceleration,epi_age_Cortical$log_pTau_age_adjusted) 
 ```

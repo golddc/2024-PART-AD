@@ -1,4 +1,4 @@
-## Tau Age hipp model (ROSMAP)
+### Tau Age hipp model (ROSMAP) (2A left)
 
 ```{r}
 library(tidyverse)
@@ -7,8 +7,9 @@ library(glmnet)
 source("~/hepler_functions.R")
 
 #Compute age adjusted pTau residual
-se <- readRDS("~/PART_AD/ROSMAP/ROSMAP_SE_New.rds")
+se <- readRDS("~/PART_AD/ROSMAP/ROSMAP_SE.rds")
 colData(se)$log_pTau_hip <- log(colData(se)$nft_hip + 1)
+colData(se)$log_pTau_mf <- log(colData(se)$nft_mf + 1)
 meta <- colData(se) %>% as.data.frame()
 pTau_hip_age_model <- lm(log_pTau_hip ~ age, data=meta)
 meta$log_pTau_hip_age_adjusted <- meta$log_pTau_hip - predict(pTau_hip_age_model,meta) #actual - predicted pTau based on age
@@ -65,7 +66,7 @@ test_pTau_hip_age_adjusted <- meta[rownames(test_mtx),"log_pTau_hip_age_adjusted
 testEN <- function(model,betas) {
   cgs <- rownames(coef(model))[-1]
   betas <- betas[,cgs]
-  predict(model,se=model[["lambda.min"]],newx=betas,type="response")
+  predict(model,s="lambda.min",newx=betas,type="response")
 }
 
 tau_age_hip_models_stat <- do.call(rbind,lapply(seq(tau_age_hip_models),function(x) {
@@ -93,8 +94,7 @@ tau_age_hipp_smry <- data.frame(
 )
 ```
 
-
-## Tau Age Midfrontal
+### Tau Age Midfrontal (2A right)
 ```{r}
 colData(se)$log_pTau_mf <- log(colData(se)$nft_mf + 1)
 pTau_mf_age_model <- lm(log_pTau_mf ~ age, data=colData(se) %>% as.data.frame())
@@ -143,4 +143,89 @@ tau_age_mf_smry <- data.frame(
   Predicted=pred[,1],
   Actual=meta$log_pTau_mf_age_adjusted
 )
+
+#Test whether hippocampal model cgs can predict midfrontal, and vice versa (2B)
+getModelCGs <- function(model) {
+  rownames(coef(model, s = "lambda.min"))[-1]
+}
+
+hipp_cgs <- getModelCGs(tau_age_hipp)
+mf_cgs <- getModelCGs(tau_age_mf)
+hipp_mtx <- t(train_mtx[hipp_cgs,]) #TauAge Hipp CGs used to predict midfrontal age adjusted tau
+mf_mtx <- t(train_mtx[mf_cgs,]) #TauAge MF CGs used to predict hipp age adjusted tau
+
+testEN <- function(model,betas) {
+  cgs <- rownames(coef(model))[-1]
+  betas <- betas[,cgs]
+  predict(model,s="lambda.min",newx=betas,type="response")
+}
+
+hipp_mf_model <- trainEN(betas=hipp_mtx,pTau = train_pTau_mf_age_adjusted)
+hipp_mf_predicted <- testEN(model=hipp_mf_model,betas=test_mtx)
+cor.test(test_pTau_mf_age_adjusted,hipp_mf_predicted)
+
+mf_hipp_model <- trainEN(betas=mf_mtx,pTau = train_pTau_hip_age_adjusted)
+mf_hipp_predicted <- testEN(model=mf_hipp_model,betas=test_mtx)
+cor.test(test_pTau_hip_age_adjusted,mf_hipp_predicted)
+```
+
+
+### Amyloid adjusted tau age models (S3D)
+
+```{r}
+#log transform total neuritic plaques, and create age and plaq adjusted residuals for hipp and mf pTau
+meta$log_n_plaq <- log(meta$plaq_n + 1)
+m1 <- lm(log_pTau_hip ~ age + log_n_plaq,data=meta)
+meta$log_pTau_hip_age_plaq_adjusted <- meta$log_pTau_hip - predict(m1,meta) #the age, plaq adjusted residual for hipp pTau
+m2 <- lm(log_pTau_mf ~ age + log_n_plaq,data=meta)
+meta$log_pTau_mf_age_plaq_adjusted <- meta$log_pTau_mf - predict(m2,meta) #the age, plaq adjusted residual for mf pTau
+se <- SummarizedExperiment(assays = assay(se),colData=meta)
+
+mtx <- cleanMatrixForClusterW(assay(se)) %>% imputeRowMean(.) 
+m <- meta %>% filter(sex == "M") %>% pull(meth_id)
+set.seed(123)
+f <- meta %>% filter(sex == "F") %>% pull(meth_id) %>% sample(.,length(m))
+set.seed(123)
+train_m <- sample(m,ceiling(length(m) * .8))
+train_f <- sample(f,ceiling(length(f) * .8))
+test_m <- m[!m %in% train_m]
+test_f <- c(f[!f %in% train_f],meta$meth_id[!meta$meth_id %in% c(m,f)]) #get remaining female testing samples 
+cgs <- rownames(mtx)
+
+fml1 <- "~ age + sex + sample_plate + log_n_plaq + log_pTau_hip" #feature selection for hip pTau
+fml2 <- "~ age + sex + sample_plate + log_n_plaq + log_pTau_mf" #feature selection for mf pTau
+
+res_hip_pTau_age_plaq_adjusted <- DML(se[cgs,], as.formula(fml1),BPPARAM=BiocParallel::MulticoreParam(40))
+smry_hip_pTau_age_plaq_adjusted <- summaryExtractTest(res_hip_pTau_age_plaq_adjusted) %>% 
+  arrange(Pval_log_pTau_hip)
+
+res_mf_pTau_age_plaq_adjusted <- DML(se[cgs,], as.formula(fml2),BPPARAM=BiocParallel::MulticoreParam(40))
+smry_mf_pTau_age_plaq_adjusted <- summaryExtractTest(res_mf_pTau_age_plaq_adjusted) %>% 
+  arrange(Pval_log_pTau_mf)
+
+#TauAgeHipp plaq adjusted
+feat <- smry_hip_pTau_age_plaq_adjusted$Probe_ID
+feat <- feat[!grepl("rs|ctl",feat)]
+n_feat <- seq(2000,30000,2000)
+train_pTau_hip_age_plaq_adjusted <- meta[c(train_m,train_f),"log_pTau_hip_age_plaq_adjusted"]
+
+tau_age_hip_aa_models <- mclapply(n_feat,function(x) {
+  cgs <- feat[1:x]
+  mtx2 <- t(train_mtx[cgs,])
+  model <- trainEN(betas=mtx2,pTau = train_pTau_hip_age_plaq_adjusted)
+},mc.cores=40) 
+names(tau_age_hip_aa_models) <- paste0("Model_",as.character(n_feat))
+
+#TauAgeMF plaq adjusted
+feat <- smry_mf_pTau_age_plaq_adjusted$Probe_ID
+feat <- feat[!grepl("rs|ctl",feat)]
+n_feat <- seq(2000,30000,2000)
+train_pTau_mf_age_plaq_adjusted <- meta[c(train_m,train_f),"log_pTau_mf_age_plaq_adjusted"]
+
+tau_age_mf_aa_models <- mclapply(n_feat,function(x) {
+  cgs <- feat[1:x]
+  mtx2 <- t(train_mtx[cgs,])
+  model <- trainEN(betas=mtx2,pTau = train_pTau_hip_age_plaq_adjusted)
+},mc.cores=40) 
+names(tau_age_mf_aa_models) <- paste0("Model_",as.character(n_feat))
 ```

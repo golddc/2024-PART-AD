@@ -43,3 +43,59 @@ se <- readRDS("~/PART_AD/ROSMAP/ROSMAP_SE.rds")
 tsne <- tsneSE(se,perplexity = 30)
 ```
 
+
+### Cell deconvolution of ROSMAP and PWG data (S1B,C,D,E)
+```{r}
+library(EpiDISH)
+library(SummarizedExperiment)
+
+#read in reference matrix
+ref_mtx <- readRDS("~/PART_AD/data/Brain_CellType_RefMtx.rds")
+cgs <- rownames(ref_mtx)
+
+#Prepare betas matrix 
+se_rosmap <- readRDS("~/PART_AD/ROSMAP/ROSMAP_SE.rds") 
+se_pwg <- readRDS("~/PART_AD/PWG/PWG_SE.rds") 
+betas <- cbind(assay(se_rosmap)[cgs,],assay(se_pwg)[cgs,])
+
+#Compute proportions and add meta data
+frac <- epidish(beta.m = betas, ref.m = ref_mtx, method = "RPC")$estF
+frac_meta <- frac %>% as.data.frame()
+col_int <- intersect(colnames(colData(se_rosmap)),colnames(colData(se_pwg)))
+meta <- rbind(
+  as.data.frame(colData(rosmap))[,col_int],
+  as.data.frame(colData(pwg))[,col_int]
+)
+frac_meta <- cbind(frac_meta,meta[rownames(frac_meta),])
+pca <- prcomp(frac)$x %>% as.data.frame()
+identical(rownames(pca),rownames(frac_meta)) #TRUE
+frac_meta <- cbind(frac_meta,pca)
+saveRDS(frac_meta,file="CellProp.rds") #plot proportions and PC1 and 2 (S1B,C)
+
+#Check if any proportions associate with pTau in PWG data (S1D)
+frac_pwg <- frac_meta[colnames(se_pwg),]
+frac_pwg$log_pTau <- colData(se_pwg)[frac_pwg$meth_id,"log_pTau"]
+summary(lm(log_pTau ~ PC1,data=frac_pwg))
+summary(lm(log_pTau ~ PC2,data=frac_pwg))
+
+frac_rosmap <- frac_meta[colnames(se_rosmap),]
+frac_rosmap$log_pTau <- log(colData(se_rosmap)[frac_rosmap$meth_id,"nft_hip"] + 1)
+summary(lm(log_pTau ~ PC1,data=frac_rosmap))
+summary(lm(log_pTau ~ PC2,data=frac_rosmap))
+
+#Test each proportion individually (S1E)
+colnames(frac_pwg) <- sub("-","_",colnames(frac_pwg)) #otherwise linear model formulas throw error
+cell_types <- sub("-","_",colnames(ref_mtx))
+cell_prop_res <- do.call(rbind,lapply(cell_types,function(x) {
+  d0 <- frac_pwg[,c(x,"log_pTau","age","sex")] #hipp is log adjusted pathology
+  fml <- as.formula(paste("log_pTau ~ age + sex + ",x))
+  smry <- summary(lm(fml,data=d0))$coefficients
+  data.frame(
+    CellType=x,
+    Formula=paste(as.character(fml)[c(2,1,3)],collapse=" "),
+    estimate=smry[x,"Estimate"],
+    P=smry[x,"Pr(>|t|)"]
+  )
+}))
+cell_prop_res$FDR <- p.adjust(cell_prop_res$P,method="fdr")
+```
